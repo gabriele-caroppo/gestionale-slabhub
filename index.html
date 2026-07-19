@@ -394,6 +394,27 @@ header{
   *{transition-duration:.01ms!important}
 }
 
+
+/* ═══════════════ Swipe orizzontale su task (completa / elimina) ═══════════════ */
+.swipe-row{position:relative;overflow:hidden;border-radius:var(--radius-md)}
+.swipe-bg{position:absolute;inset:0;display:flex;align-items:center;font-weight:700;font-size:13px;color:#fff;border-radius:var(--radius-md)}
+.swipe-bg-left{background:var(--green);justify-content:flex-start;padding-left:22px}
+.swipe-bg-right{background:var(--red);justify-content:flex-end;padding-right:22px}
+.swipe-row>:last-child{position:relative;z-index:1;touch-action:pan-y}
+
+
+/* ── Archivio mensile ── */
+.archive-section{margin-top:18px}
+.archive-title{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);margin-bottom:10px}
+.archive-folder{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);margin-bottom:8px;overflow:hidden}
+.archive-folder-header{display:flex;align-items:center;gap:10px;width:100%;padding:12px 15px;background:transparent;border:0;cursor:pointer;text-align:left;color:var(--text2)}
+.archive-folder-header:hover{background:var(--surface2);color:var(--text)}
+.archive-folder-name{flex:1;font-size:13px;font-weight:600}
+.archive-folder-count{font-family:var(--font-mono);font-size:10px;color:var(--text3);background:var(--surface3);border-radius:999px;padding:2px 8px}
+.archive-folder-body{padding:0 12px 12px;display:flex;flex-direction:column;gap:8px}
+.comp-cat-arrow{transition:transform .18s var(--ease,ease);color:var(--text3);font-size:11px}
+.comp-cat-arrow.open{transform:rotate(90deg)}
+
 </style>
 </head>
 <body class="readonly">
@@ -566,6 +587,53 @@ header{
   }
 
   // ── Render ──────────────────────────────────────────────────
+  // Archivio mensile: una task completata viene archiviata 10gg dopo la fine del suo mese
+  const ARCHIVE_MONTHS_IT = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
+  const archiveOpen = new Set();
+  function isArchivableTask(t) {
+    if (t.status !== 'done' || !t.createdAt) return false;
+    const d = new Date(t.createdAt);
+    const threshold = new Date(d.getFullYear(), d.getMonth()+1, 10);
+    return Date.now() >= threshold.getTime();
+  }
+  function archiveMonthKey(createdAt) {
+    const d = new Date(createdAt);
+    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+  }
+  function archiveMonthLabel(key) {
+    const [y,m] = key.split('-').map(Number);
+    return ARCHIVE_MONTHS_IT[m-1] + ' ' + y;
+  }
+  window.toggleArchiveMonth = function(cid, key) {
+    const ak = cid + '|' + key;
+    if (archiveOpen.has(ak)) archiveOpen.delete(ak); else archiveOpen.add(ak);
+    renderTasks(cid);
+  };
+  function archiveFoldersHTML(cid, archived) {
+    if (!archived.length) return '';
+    const byMonth = {};
+    archived.forEach(([tid,t]) => {
+      const k = archiveMonthKey(t.createdAt);
+      (byMonth[k] = byMonth[k] || []).push([tid,t]);
+    });
+    const keys = Object.keys(byMonth).sort().reverse();
+    return `<div class="archive-section">
+      <div class="archive-title">📦 Archivio</div>
+      ${keys.map(k => {
+        const items = byMonth[k];
+        const isOpen = archiveOpen.has(cid+'|'+k);
+        return `<div class="archive-folder">
+          <button class="archive-folder-header" onclick="toggleArchiveMonth('${cid}','${k}')">
+            <span class="archive-folder-name">${archiveMonthLabel(k)}</span>
+            <span class="archive-folder-count">${items.length}</span>
+            <span class="comp-cat-arrow${isOpen?' open':''}">▶</span>
+          </button>
+          ${isOpen ? `<div class="archive-folder-body">${items.map(([tid,t]) => renderTaskWrapper(cid,tid,t)).join('')}</div>` : ''}
+        </div>`;
+      }).join('')}
+    </div>`;
+  }
+
   function renderTasks(cid) {
     const tasks = allTasks[cid] || {};
     const statusOrder = { inprogress:0, todo:1, incomplete:2, missingfiles:3, done:4 };
@@ -609,7 +677,9 @@ header{
       return;
     }
 
-    listEl.innerHTML = arr.map(([tid, task]) => renderTaskWrapper(cid, tid, task)).join('');
+    const activeArr = arr.filter(([,t]) => !isArchivableTask(t));
+    const archivedArr = arr.filter(([,t]) => isArchivableTask(t));
+    listEl.innerHTML = (activeArr.length ? activeArr.map(([tid, task]) => renderTaskWrapper(cid, tid, task)).join('') : '<div class="empty-state">Nessuna task attiva — tutto archiviato.</div>') + archiveFoldersHTML(cid, archivedArr);
 
     openAccordions.forEach(tid => {
       const panel = document.getElementById(`sub-panel-${tid}`);
@@ -907,6 +977,92 @@ header{
   initFirebase(cfg).then(() => {
     setTimeout(async () => { if (db) await seedSlabHub(db); }, 1500);
   });
+
+// ── SWIPE gestures su task-wrapper: swipe destra=completa, swipe sinistra=elimina ──
+// Riusa i controlli reali già esistenti (select stato + bottone elimina), quindi
+// rispetta automaticamente edit-mode/readonly: se il controllo è nascosto (display:none),
+// lo swipe non fa nulla.
+(function(){
+  const THRESHOLD = 70;
+  const MAXDRAG = 92;
+  let active = null;
+
+  function ensureWrapped(wrapper){
+    let row = wrapper.querySelector(':scope > .swipe-row > :last-child');
+    if(row) return row;
+    row = wrapper.firstElementChild;
+    if(!row) return null;
+    const container = document.createElement('div');
+    container.className = 'swipe-row';
+    row.parentNode.insertBefore(container, row);
+    const bgLeft = document.createElement('div');
+    bgLeft.className = 'swipe-bg swipe-bg-left';
+    bgLeft.innerHTML = '<span>✓ Completa</span>';
+    const bgRight = document.createElement('div');
+    bgRight.className = 'swipe-bg swipe-bg-right';
+    bgRight.innerHTML = '<span>🗑 Elimina</span>';
+    container.appendChild(bgLeft);
+    container.appendChild(bgRight);
+    container.appendChild(row);
+    return row;
+  }
+
+  function isVisible(el){
+    return !!el && el.offsetParent !== null;
+  }
+
+  function findControl(wrapper, kind){
+    if(kind === 'complete') return wrapper.querySelector('.sel, .status-select');
+    return wrapper.querySelector('.ibtn.del, .icon-btn.delete');
+  }
+
+  function onPointerDown(e){
+    if(e.pointerType === 'mouse' && e.button !== 0) return;
+    if(e.target.closest('select,button,input,textarea,a,.qa-pill')) return;
+    const wrapper = e.target.closest('.task-wrapper');
+    if(!wrapper) return;
+    const row = ensureWrapped(wrapper);
+    if(!row) return;
+    active = { wrapper, row, startX:e.clientX, startY:e.clientY, curX:0, dragging:false, pointerId:e.pointerId };
+  }
+
+  function onPointerMove(e){
+    if(!active || active.pointerId !== e.pointerId) return;
+    const dx = e.clientX - active.startX, dy = e.clientY - active.startY;
+    if(!active.dragging){
+      if(Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      if(Math.abs(dy) > Math.abs(dx)){ active = null; return; }
+      active.dragging = true;
+      active.row.style.transition = 'none';
+    }
+    e.preventDefault();
+    active.curX = Math.max(-MAXDRAG, Math.min(MAXDRAG, dx));
+    active.row.style.transform = `translateX(${active.curX}px)`;
+  }
+
+  function onPointerUp(e){
+    if(!active || active.pointerId !== e.pointerId) return;
+    const { row, wrapper, curX, dragging } = active;
+    row.style.transition = 'transform .25s var(--ease-spring)';
+    row.style.transform = 'translateX(0)';
+    if(dragging && Math.abs(curX) > THRESHOLD){
+      if(curX > 0){
+        const sel = findControl(wrapper,'complete');
+        if(isVisible(sel)){ sel.value = 'done'; sel.dispatchEvent(new Event('change',{bubbles:true})); }
+      }else{
+        const btn = findControl(wrapper,'delete');
+        if(isVisible(btn)) btn.click();
+      }
+    }
+    active = null;
+  }
+
+  document.addEventListener('pointerdown', onPointerDown);
+  document.addEventListener('pointermove', onPointerMove, {passive:false});
+  document.addEventListener('pointerup', onPointerUp);
+  document.addEventListener('pointercancel', onPointerUp);
+})();
+
 </script>
 </body>
 </html>
